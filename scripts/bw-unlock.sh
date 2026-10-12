@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# bw-unlock.sh — non-interactive Bitwarden vault unlock for Hermes terminal calls.
+# Sets BW_SESSION in the current shell so subsequent `bw` commands work.
+#
+# Usage:
+#   source scripts/bw-unlock.sh && bw get password my-service
+#
+# CREDENTIAL STANDARD: BW Master Pass comes from Apple Keychain (service
+# Bitwarden-Master) — never from .env or a password file on macOS. This
+# script enforces it: on every unlock it resolves the master password from
+# env, then Keychain, then hard-errors. Same for the API-key halves
+# (Bitworder-ClientID / Bitworder-ClientSecret) used for `bw login --apikey`.
+# See references/keychain.md for one-time setup.
+#
+# Optional env vars (only as an override or on non-macOS):
+#   BW_CLIENTID     - API key client ID (override for `bw login --apikey`)
+#   BW_CLIENTSECRET - API key client secret (override)
+#   BW_PASSWORD     - master password (override; fallback on Linux/Windows
+#                     where no Keychain exists — protect with chmod 600 files)
+#
+# Requires: `bw` on PATH. `jq` is preferred for JSON parsing but NOT required —
+# the script falls back to grep for status extraction when jq is absent.
+#
+# NOTE: CLI v2026.7.0's `bw status --raw` is not recognized for `status`; it
+# outputs the full JSON instead of a single word. We parse the JSON directly.
+#
+set -euo pipefail
+
+# --- Helper: get vault status as a bare string (jq-free fallback) -------------
+_status() {
+  if command -v jq >/dev/null 2>&1; then
+    bw status 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true
+  else
+    bw status 2>/dev/null | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || true
+  fi
+}
+
+# --- Re-export BW_SESSION if already present and still valid ----------------
+if [ -n "${BW_SESSION:-}" ]; then
+  if [ "$(_status)" = "unlocked" ] && bw --session "$BW_SESSION" status 2>/dev/null >/dev/null; then
+    echo "bw-unlock: already unlocked"
+    return 0 2>/dev/null || true
+  fi
+  unset BW_SESSION
+fi
+
+# --- Ensure we are logged in ------------------------------------------------
+cur_status="$(_status)"
+if [ "$cur_status" != "locked" ] && [ "$cur_status" != "unlocked" ]; then
+  echo "bw-unlock: not logged in — attempting API-key login"
+  # Retrieve API credentials from env, or fall back to macOS Keychain
+  if [ -z "${BW_CLIENTID:-}" ] && [ -z "${BW_CLIENTSECRET:-}" ]; then
+    if [ "$(uname)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+      BW_CLIENTID=$(security find-generic-password -s "Bitworder-ClientID" -w 2>/dev/null) || true
+      BW_CLIENTSECRET=$(security find-generic-password -s "Bitworder-ClientSecret" -w 2>/dev/null) || true
+    fi
+  fi
+  if [ -n "${BW_CLIENTID:-}" ] && [ -n "${BW_CLIENTSECRET:-}" ]; then
+    bw login --apikey --nointeraction
+  else
+    echo "bw-unlock: ERROR — set BW_CLIENTID and BW_CLIENTSECRET in .env (or Keychain on macOS), or log in interactively first"
+    return 1 2>/dev/null || exit 1
+  fi
+fi
+
+# --- Unlock the vault -------------------------------------------------------
+# Resolve BW_PASSWORD: check env first, then fall back to macOS Keychain
+if [ -z "${BW_PASSWORD:-}" ] && [ "$(uname)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+  BW_PASSWORD=$(security find-generic-password -s "Bitwarden-Master" -w 2>/dev/null) || true
+fi
+if [ -n "${BW_PASSWORD:-}" ]; then
+  # bw unlock --passwordenv expects BW_PASSWORD to be an exported env var
+  export BW_PASSWORD
+  export BW_SESSION="$(bw unlock --passwordenv BW_PASSWORD --raw)"
+else
+  echo "bw-unlock: ERROR — BW_PASSWORD not set; store it in .env or retrieve from macOS Keychain (see references/keychain.md)"
+  return 1 2>/dev/null || exit 1
+fi
+
+# --- Verify -----------------------------------------------------------------
+if [ "$(_status)" = "unlocked" ]; then
+  echo "bw-unlock: vault unlocked"
+  return 0 2>/dev/null || true
+else
+  echo "bw-unlock: ERROR — unlock failed"
+  return 1 2>/dev/null || exit 1
+fi

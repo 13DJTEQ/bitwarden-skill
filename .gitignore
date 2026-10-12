@@ -1,0 +1,6 @@
+.env
+.bw-value-cache/
+.bw-session-cache
+__pycache__/
+*.pyc
+.pytest_cache/
